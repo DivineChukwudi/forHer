@@ -7,10 +7,9 @@ import {
   CarouselItem,
   type CarouselApi,
 } from "@/components/ui/carousel";
-import { ChevronLeft, ChevronRight, Download, Film, Heart, Maximize2, Music2, Pause, Play, SkipBack, SkipForward, Sparkles, Trash2, Volume2, VolumeX, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Film, Heart, Maximize2, Music2, Pause, Play, SkipBack, SkipForward, Sparkles, Trash2, Video, Volume2, VolumeX, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-// @ts-ignore — html2canvas is typed loosely but works perfectly at runtime
-import html2canvas from "html2canvas";
+import { toPng } from "html-to-image";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -229,6 +228,29 @@ const OLD_HER_MESSAGES: string[] = [
   "This is your life. Live it for the girl you were, the woman you are, and the future that's waiting for both of you.",
 ];
 
+const nextFrames = () =>
+  new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+
+const loadImage = (src: string) =>
+  new Promise<HTMLImageElement>((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = () => rej(new Error("Image failed to load"));
+    img.src = src;
+  });
+
+const pickRecorderMime = (): string | null => {
+  if (typeof MediaRecorder === "undefined") return null;
+  const candidates = [
+    "video/mp4;codecs=avc1.42E01E",
+    "video/mp4",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+  ];
+  return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? null;
+};
+
 function buildSlides(): Slide[] {
   const userYoung = toSortedEntries(youngMedia);
   const userOld = toSortedEntries(oldMedia, { forceLast: true });
@@ -327,6 +349,10 @@ function Index() {
   const [hearts, setHearts] = useState<Heart[]>([]);
   const heartId = useRef(0);
   const downloadCardRef = useRef<HTMLDivElement | null>(null);
+  // While exporting, a still of the current video frame is laid over the <video>
+  // so the screenshot library captures real pixels (it can't read live video).
+  const [exportFrame, setExportFrame] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   const slides = useMemo(buildSlides, []);
   const [carouselApi, setCarouselApi] = useState<CarouselApi | null>(null);
@@ -392,6 +418,7 @@ function Index() {
   const [isMusicPlaying, setIsMusicPlaying] = useState(false);
   const [isMusicMuted, setIsMusicMuted] = useState(false);
   const [needsMusicKickoff, setNeedsMusicKickoff] = useState(false);
+  const [entered, setEntered] = useState(false);
   const MUSIC_VOLUME = 0.6;
 
   useEffect(() => {
@@ -548,23 +575,32 @@ function Index() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mounted]);
 
-  // Try "kickoff" music on the first meaningful user interaction anywhere
-  // (browsers block autoplay until the user interacts with the page at least once).
+  // Browsers only allow sound after a real user gesture. Pointer-DOWN does not count
+  // for touch (activation comes on pointerup / touchend / click), so listen to all of
+  // them and keep listening until play() actually succeeds.
   useEffect(() => {
     if (!mounted || !needsMusicKickoff || songs.length === 0) return;
-    let fired = false;
-    const handler = (ev: Event) => {
-      if (fired) return;
-      fired = true;
-      ev.currentTarget?.removeEventListener("pointerdown", handler as EventListener);
-      playMusic();
+    const events = ["pointerup", "click", "touchend", "keydown"] as const;
+    const handler = () => {
+      const a = musicAudioRef.current;
+      if (!a) return;
+      a.volume = MUSIC_VOLUME;
+      a.muted = isMusicMuted;
+      void a.play().then(
+        () => {
+          setIsMusicPlaying(true);
+          setNeedsMusicKickoff(false);
+        },
+        () => {
+          /* not a valid gesture yet — keep listening */
+        },
+      );
     };
-    const opts: AddEventListenerOptions = { passive: true };
-    window.addEventListener("pointerdown", handler as EventListener, opts);
+    for (const ev of events) window.addEventListener(ev, handler, { passive: true });
     return () => {
-      if (!fired) window.removeEventListener("pointerdown", handler as EventListener);
+      for (const ev of events) window.removeEventListener(ev, handler);
     };
-  }, [mounted, needsMusicKickoff, playMusic]);
+  }, [mounted, needsMusicKickoff, isMusicMuted, MUSIC_VOLUME]);
 
   useEffect(() => {
     if (hearts.length === 0) return;
@@ -672,62 +708,181 @@ function Index() {
     }
   }, [focusedSlide, focusedIndex, triggerDownload]);
 
+  // Snapshot the card exactly as rendered (browser does the CSS rendering via SVG
+  // foreignObject, unlike html2canvas which re-implements CSS and drops effects).
+  const renderCardPng = useCallback(
+    async (pixelRatio: number): Promise<string> => {
+      const el = downloadCardRef.current;
+      if (!el) throw new Error("Card not mounted");
+      const vid = focusedVideoRef.current;
+      if (focusedSlide?.kind === "video" && vid && vid.videoWidth > 0) {
+        const c = document.createElement("canvas");
+        c.width = vid.videoWidth;
+        c.height = vid.videoHeight;
+        c.getContext("2d")?.drawImage(vid, 0, 0);
+        setExportFrame(c.toDataURL("image/jpeg", 0.92));
+        await nextFrames();
+      }
+      try {
+        await document.fonts.ready;
+        return await toPng(el, {
+          pixelRatio,
+          filter: (node: Node) =>
+            !(node instanceof HTMLElement) ||
+            (!node.hasAttribute("data-export-ignore") && node.tagName !== "VIDEO"),
+        });
+      } finally {
+        setExportFrame(null);
+      }
+    },
+    [focusedSlide],
+  );
+
   const downloadCard = useCallback(async () => {
-    if (!focusedSlide) return;
-    const cardEl = downloadCardRef.current;
-    if (!cardEl) return;
-
-    // Screenshot the actual rendered glass card — so the PNG is pixel-perfect
-    // identical to what she sees on screen (same rounded corners, glass ring,
-    // lavender/rose tints, wrapped message, badges, etc.)
-    // Works for both photos AND videos: html2canvas will paint the video's
-    // current frame onto the canvas, so the message card gets appended to
-    // video clips the exact same way it does for photos.
+    if (!focusedSlide || exporting) return;
+    setExporting(true);
     try {
-      const scale = 2; // crisp 2x retina PNG
-      const canvas = (await html2canvas(cardEl, {
-        backgroundColor: null, // keep the card's own bg + transparency around it
-        scale,
-        useCORS: true,
-        allowTaint: true,
-        logging: false,
-        ignoreElements: (el: Element) => {
-          // Skip the 3 header action pills (Download / Film / Close) so the
-          // keepsake doesn't have UI buttons baked in. Keep the era-counter pill.
-          if (!(el instanceof HTMLElement)) return false;
-          const aria = el.getAttribute("aria-label") ?? "";
-          if (
-            aria === "Download this card as a keepsake PNG (matches what you see)" ||
-            aria === "Download just the video clip (MP4, no message card)" ||
-            aria === "Close"
-          ) {
-            return true;
-          }
-          return false;
-        },
-      })) as HTMLCanvasElement;
-
-      // If she opened this on a video, paint a subtle "· clip" badge under
-      // the photo area (matching the DOM label) so the PNG clearly conveys
-      // "this was a video, with the message card."
-      const png = canvas.toDataURL("image/png");
+      const png = await renderCardPng(2);
       triggerDownload(png, `for-reabetsoe-${focusedIndex ?? 0}-${focusedSlide.era}.png`);
     } catch (err) {
-      // html2canvas can fail on some video CORS setups. Fallback: if it's an
-      // image, at least download the raw photo. If it's a video, fall back to
-      // the MP4. The user primarily wants "the card + message", and only in
-      // extreme browser CORS cases does this gracefully degrade.
       console.warn("Card PNG capture failed, using fallback", err);
-      if (focusedSlide.kind === "video") {
-        void downloadClipOnly();
-      } else {
-        triggerDownload(focusedSlide.src, `for-reabetsoe-${focusedIndex ?? 0}-${focusedSlide.era}.png`);
-      }
+      if (focusedSlide.kind === "video") void downloadClipOnly();
+      else triggerDownload(focusedSlide.src, `for-reabetsoe-${focusedIndex ?? 0}-${focusedSlide.era}.jpg`);
+    } finally {
+      setExporting(false);
     }
-  }, [focusedSlide, focusedIndex, triggerDownload, downloadClipOnly]);
+  }, [focusedSlide, focusedIndex, exporting, renderCardPng, triggerDownload, downloadClipOnly]);
+
+  // Video WITH the message card: draw the card snapshot + the playing video into a
+  // canvas and record it. Runs in real time (takes as long as the clip), video is
+  // muted in this site so there's no audio track to lose.
+  const downloadCardVideo = useCallback(async () => {
+    const vid = focusedVideoRef.current;
+    const card = downloadCardRef.current;
+    if (!focusedSlide || focusedSlide.kind !== "video" || !vid || !card || exporting) return;
+    const mime = pickRecorderMime();
+    if (!mime) {
+      void downloadClipOnly();
+      return;
+    }
+    setExporting(true);
+    const wasLoop = vid.loop;
+    let raf = 0;
+    try {
+      vid.pause();
+      const cardRect = card.getBoundingClientRect();
+      const vidRect = vid.getBoundingClientRect();
+      const bg = await loadImage(await renderCardPng(1.5));
+      const k = bg.naturalWidth / cardRect.width;
+      const W = bg.naturalWidth & ~1;
+      const H = bg.naturalHeight & ~1;
+      const dx = (vidRect.left - cardRect.left) * k;
+      const dy = (vidRect.top - cardRect.top) * k;
+      const dw = vidRect.width * k;
+      const dh = vidRect.height * k;
+      const vw = vid.videoWidth;
+      const vh = vid.videoHeight;
+      const sc = Math.max(dw / vw, dh / vh); // object-cover crop
+      const sw = dw / sc;
+      const sh = dh / sc;
+      const sx = (vw - sw) / 2;
+      const sy = (vh - sh) / 2;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("No 2d context");
+      const rr = ctx as CanvasRenderingContext2D & {
+        roundRect?: (x: number, y: number, w: number, h: number, r: number) => void;
+      };
+      const draw = () => {
+        ctx.drawImage(bg, 0, 0, W, H);
+        ctx.save();
+        ctx.beginPath();
+        if (rr.roundRect) rr.roundRect(dx, dy, dw, dh, 26 * k);
+        else ctx.rect(dx, dy, dw, dh);
+        ctx.clip();
+        ctx.drawImage(vid, sx, sy, sw, sh, dx, dy, dw, dh);
+        ctx.restore();
+      };
+
+      const rec = new MediaRecorder(canvas.captureStream(30), {
+        mimeType: mime,
+        videoBitsPerSecond: 6_000_000,
+      });
+      const chunks: Blob[] = [];
+      rec.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data);
+      };
+      const stopped = new Promise<void>((res) => {
+        rec.onstop = () => res();
+      });
+
+      vid.loop = false;
+      if (vid.currentTime > 0) {
+        await new Promise<void>((res) => {
+          vid.onseeked = () => res();
+          vid.currentTime = 0;
+          setTimeout(res, 1500);
+        });
+      }
+      rec.start(250);
+      await vid.play();
+      const tick = () => {
+        draw();
+        raf = requestAnimationFrame(tick);
+      };
+      tick();
+      await new Promise<void>((res) => {
+        vid.onended = () => res();
+        setTimeout(res, ((vid.duration || 30) + 2) * 1000);
+      });
+      cancelAnimationFrame(raf);
+      draw();
+      rec.stop();
+      await stopped;
+
+      const ext = mime.startsWith("video/mp4") ? "mp4" : "webm";
+      const url = URL.createObjectURL(new Blob(chunks, { type: mime.split(";")[0] ?? "video/webm" }));
+      triggerDownload(url, `for-reabetsoe-${focusedIndex ?? 0}-${focusedSlide.era}.${ext}`);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (err) {
+      console.warn("Card video export failed", err);
+      void downloadClipOnly();
+    } finally {
+      cancelAnimationFrame(raf);
+      vid.onended = null;
+      vid.onseeked = null;
+      vid.loop = wasLoop;
+      void vid.play().catch(() => {});
+      setExporting(false);
+    }
+  }, [focusedSlide, focusedIndex, exporting, renderCardPng, triggerDownload, downloadClipOnly]);
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-gradient-to-b from-night-1 via-night-2 to-night-3 font-body text-foreground">
+      {/* ---------- Tap-to-begin gate: the tap unlocks sound so music can start ---------- */}
+      {mounted && !entered && needsMusicKickoff && songs.length > 0 ? (
+        <div className="fixed inset-0 z-[300] flex flex-col items-center justify-center gap-6 bg-gradient-to-b from-night-1 via-night-2 to-night-3 px-6 text-center">
+          <p className="font-hand text-5xl text-rose sm:text-6xl">for Reabetsoe</p>
+          <p className="max-w-[28ch] text-sm text-white/70">
+            Turn your sound on, minxi. Tap below and I'll play your songs while you look around.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setEntered(true);
+              playMusic();
+            }}
+            className="inline-flex items-center gap-2 rounded-full bg-rose/80 px-7 py-3 text-sm font-semibold uppercase tracking-[0.18em] text-white ring-1 ring-white/20 transition hover:bg-rose active:scale-95"
+          >
+            <Heart className="size-4" fill="currentColor" />
+            Open your care package
+          </button>
+        </div>
+      ) : null}
+
       {/* starfield */}
       <div className="pointer-events-none absolute inset-0" aria-hidden="true">
         {STARS.map((star, i) => (
@@ -972,7 +1127,8 @@ function Index() {
                               <img
                                 src={slide.src}
                                 alt={`${slide.label} — Reabetsoe`}
-                                loading="lazy"
+                                loading={i === 0 ? "eager" : "lazy"}
+                                decoding="async"
                                 onError={() =>
                                   setMediaError((m) => ({
                                     ...m,
@@ -1415,7 +1571,7 @@ function Index() {
           onEnded={handleSongEnded}
           onPlay={() => setIsMusicPlaying(true)}
           onPause={() => setIsMusicPlaying((p) => (musicAudioRef.current?.ended ? p : false))}
-          preload="metadata"
+          preload="auto"
           crossOrigin="anonymous"
           suppressHydrationWarning
         />
@@ -1496,9 +1652,10 @@ function Index() {
                     · {focusedIndex + 1} of {slides.length}
                   </span>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2" data-export-ignore>
                   <button
                     type="button"
+                    disabled={exporting}
                     onClick={downloadCard}
                     className="grid size-10 place-items-center rounded-full bg-white/10 text-white ring-1 ring-white/15 backdrop-blur-md transition hover:bg-gold/70 hover:text-accent-foreground active:scale-95"
                     aria-label="Download this card as a keepsake PNG (matches what you see)"
@@ -1507,8 +1664,20 @@ function Index() {
                     <Download className="size-4.5" />
                   </button>
                   {focusedSlide?.kind === "video" ? (
+                    <>
                     <button
                       type="button"
+                      disabled={exporting}
+                      onClick={downloadCardVideo}
+                      className="grid size-10 place-items-center rounded-full bg-white/10 text-white ring-1 ring-white/15 backdrop-blur-md transition hover:bg-lav/70 hover:text-accent-foreground active:scale-95 disabled:opacity-50"
+                      aria-label="Download the video with the message card"
+                      title="Download video + message card (records in real time)"
+                    >
+                      <Video className="size-4.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={exporting}
                       onClick={downloadClipOnly}
                       className="grid size-10 place-items-center rounded-full bg-white/10 text-white ring-1 ring-white/15 backdrop-blur-md transition hover:bg-mint/70 hover:text-accent-foreground active:scale-95"
                       aria-label="Download just the video clip (MP4, no message card)"
@@ -1516,6 +1685,7 @@ function Index() {
                     >
                       <Film className="size-4.5" />
                     </button>
+                    </>
                   ) : null}
                   <button
                     type="button"
@@ -1575,6 +1745,13 @@ function Index() {
                         className="aspect-[4/3] w-full h-full object-cover"
                         aria-label={`${focusedSlide.label} — Reabetsoe (enlarged)`}
                       />
+                      {exportFrame ? (
+                        <img
+                          src={exportFrame}
+                          alt=""
+                          className="absolute inset-0 h-full w-full object-cover"
+                        />
+                      ) : null}
                     </div>
                   ) : (
                     <img
